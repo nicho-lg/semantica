@@ -5,6 +5,7 @@ Wrapper for LiteLLM library that provides unified access to 100+ LLM providers.
 Supports OpenAI, Anthropic, Groq, Azure, Bedrock, Vertex AI, and many more.
 """
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 
 from ..utils.exceptions import ProcessingError
 from ..utils.logging import get_logger
+from ..semantic_extract.providers import ResponseText
 
 logger = get_logger("llms.litellm")
 
@@ -25,6 +27,64 @@ else:
     logger.warning(
         "litellm library not installed. Install with: pip install litellm"
     )
+
+
+def _extract_first_json(text: str):
+    """Scan *text* for the first top-level JSON value (object or array) and
+    return the parsed Python object, or ``None`` if no valid JSON is found.
+
+    Unlike a simple regex approach this walks forward character-by-character so
+    it correctly handles:
+    * Nested objects and arrays  (``{"a": [1, 2]}``).
+    * String literals that contain brackets  (``{"k": "[not a list]"}``).
+    * Misleading prose brackets before the actual JSON
+      (``"Intro [not JSON] then {"ok": 1}"``).
+
+    The first ``{`` or ``[`` that forms a complete, valid JSON value wins.
+    If a candidate starting position produces invalid JSON we move on to the
+    next candidate rather than raising immediately.
+    """
+    OPEN = {"{": "}", "[": "]"}
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch not in OPEN:
+            i += 1
+            continue
+        close = OPEN[ch]
+        # Walk forward tracking nesting depth and string state.
+        depth = 0
+        in_string = False
+        escape_next = False
+        j = i
+        while j < n:
+            c = text[j]
+            if escape_next:
+                escape_next = False
+            elif in_string:
+                if c == "\\":
+                    escape_next = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c == ch:
+                    depth += 1
+                elif c == close:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i : j + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            # This opening bracket doesn't form valid JSON;
+                            # advance past it and keep looking.
+                            break
+            j += 1
+        i += 1
+    return None
 
 
 class LiteLLM:
@@ -109,16 +169,32 @@ class LiteLLM:
                 **options
             )
             
+            # Metadata the provenance wrappers read back off the returned value.
+            # Only usage and cost are kept: the rest of _hidden_params can hold
+            # api_base and provider response headers.
+            hidden_params = getattr(response, '_hidden_params', None) or {}
+            usage = getattr(response, 'usage', None)
+            if usage is None and isinstance(response, dict):
+                usage = response.get('usage')
+            meta = {
+                "usage": usage,
+                "cost": hidden_params.get('response_cost'),
+            }
+
+            def _wrap(content):
+                # Tool-call, refusal and content-filter replies carry no text.
+                return None if content is None else ResponseText(content, **meta)
+
             # Extract text from response
             if hasattr(response, 'choices') and len(response.choices) > 0:
-                return response.choices[0].message.content
+                return _wrap(response.choices[0].message.content)
             elif isinstance(response, dict):
                 if 'choices' in response and len(response['choices']) > 0:
-                    return response['choices'][0]['message']['content']
+                    return _wrap(response['choices'][0]['message']['content'])
                 elif 'content' in response:
-                    return response['content']
+                    return _wrap(response['content'])
             elif isinstance(response, str):
-                return response
+                return _wrap(response)
             
             raise ProcessingError(f"Unexpected response format from LiteLLM: {type(response)}")
             
@@ -147,7 +223,6 @@ class LiteLLM:
             )
 
         try:
-            import json
             
             # Add JSON format instruction to prompt
             json_prompt = f"{prompt}\n\nReturn the response as valid JSON only."
@@ -182,11 +257,13 @@ class LiteLLM:
             try:
                 return json.loads(text_response)
             except json.JSONDecodeError:
-                # Try to extract JSON from text
-                import re
-                json_match = re.search(r'\{.*\}', text_response, re.DOTALL)
-                if json_match:
-                    return json.loads(json_match.group())
+                # Primary parse failed — prose surrounds the JSON.  Scan forward
+                # from each candidate opening bracket ({, [) and find its
+                # matching closing delimiter, correctly tracking nesting and
+                # string literals so we never pair unrelated brackets.
+                extracted = _extract_first_json(text_response)
+                if extracted is not None:
+                    return extracted
                 raise ProcessingError(f"Failed to parse JSON from LiteLLM response: {text_response[:200]}")
                 
         except Exception as e:
